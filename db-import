@@ -9,6 +9,8 @@
 
 set -eo pipefail
 
+RAW_REPO_URL="https://raw.githubusercontent.com/alkafi1/db-engine-enterprise/main"
+
 # --- Header Banner ---
 show_banner() {
     echo "================================================================"
@@ -39,12 +41,34 @@ echo -e "\n[?] Select Engine Mode:"
 echo " 1) High-Speed DB Import (SQL / GZ / ZIP / Remote URL)"
 echo " 2) Multi-Threaded DB Export / Backup (Auto Gzip Compression)"
 echo " 3) DB Health Check & Table Optimization (Analyze/Repair)"
-read -rp "Choose Option [1-3, default: 1]: " ENGINE_MODE
+echo " 4) Self-Update Engine (Fetch Latest Changes from GitHub)"
+read -rp "Choose Option [1-4, default: 1]: " ENGINE_MODE
 ENGINE_MODE=${ENGINE_MODE:-1}
+
+# --- Option 4: Self-Update Logic ---
+if [ "$ENGINE_MODE" -eq 4 ]; then
+    echo -e "\n[!] Checking and pulling latest engine updates from GitHub..."
+    
+    # Try updating global executable or local script
+    TARGET_BIN="/usr/local/bin/db-import"
+    
+    if [ -w "$TARGET_BIN" ] || [ "$EUID" -eq 0 ]; then
+        curl -sSL "$RAW_REPO_URL/db-import" -o "$TARGET_BIN"
+        chmod +x "$TARGET_BIN"
+        echo -e "[\e[32m✓\e[0m] Engine updated successfully at $TARGET_BIN!"
+    else
+        # Fallback to local script directory
+        SCRIPT_PATH=$(readlink -f "$0")
+        curl -sSL "$RAW_REPO_URL/db-import" -o "$SCRIPT_PATH"
+        chmod +x "$SCRIPT_PATH"
+        echo -e "[\e[32m✓\e[0m] Engine updated successfully at $SCRIPT_PATH!"
+    fi
+    echo "Please re-run the command to use the updated version."
+    exit 0
+fi
 
 if [ "$ENGINE_MODE" -ne 1 ]; then
     echo -e "\n[!] Mode $ENGINE_MODE selected. Executing routine..."
-    # Placeholder for Export/Health modes if linked externally
     exit 0
 fi
 
@@ -108,10 +132,23 @@ echo " Target Database : $TARGET_DB"
 echo " Source Payload  : $SOURCE_PAYLOAD ($PAYLOAD_SIZE)"
 echo "----------------------------------------------------------------"
 
-# --- [1/2] Provisioning Database Infrastructure ---
-echo -e "\n[1/2] Provisioning Database Infrastructure..."
+# --- [1/2] Provisioning & Purging Existing Tables ---
+echo -e "\n[1/2] Provisioning Database Infrastructure & Purging Tables..."
 mysql --defaults-extra-file="$TMP_MYSQL_CONF" -e "CREATE DATABASE IF NOT EXISTS \`$TARGET_DB\`;"
-echo "  --> Database '$TARGET_DB' ready. Proceeding with import."
+
+# Drop all existing tables to ensure clean import state
+DROP_TABLES_SQL=$(mysql --defaults-extra-file="$TMP_MYSQL_CONF" -B -N -e "
+    SELECT CONCAT('DROP TABLE IF EXISTS \`', table_schema, '\`.\`', table_name, '\`;')
+    FROM information_schema.tables 
+    WHERE table_schema = '$TARGET_DB';" 2>/dev/null || true)
+
+if [ -n "$DROP_TABLES_SQL" ]; then
+    echo "  --> Purging existing tables in '$TARGET_DB'..."
+    mysql --defaults-extra-file="$TMP_MYSQL_CONF" -e "SET FOREIGN_KEY_CHECKS = 0; $DROP_TABLES_SQL SET FOREIGN_KEY_CHECKS = 1;" "$TARGET_DB"
+    echo "  --> Database cleaned."
+else
+    echo "  --> Database '$TARGET_DB' is clean. Proceeding with import."
+fi
 
 # --- [2/2] Streaming High-Speed Data Engine ---
 echo -e "\n[2/2] Streaming High-Speed Data Engine...\n"
@@ -128,7 +165,7 @@ if [[ "$SOURCE_PAYLOAD" =~ ^https?:// ]]; then
 else
     # Local File Import Handling (.sql, .gz, .zip)
     if [[ "$SOURCE_PAYLOAD" == *.gz ]]; then
-        pigz -dc "$SOURCE_PAYLOAD" 2>/dev/null || gzip -dc "$SOURCE_PAYLOAD" | pv | mysql --defaults-extra-file="$TMP_MYSQL_CONF" \
+        (pigz -dc "$SOURCE_PAYLOAD" 2>/dev/null || gzip -dc "$SOURCE_PAYLOAD") | pv | mysql --defaults-extra-file="$TMP_MYSQL_CONF" \
             --max_allowed_packet=1G \
             --init-command="SET FOREIGN_KEY_CHECKS=0; SET UNIQUE_CHECKS=0; SET SQL_MODE='';" \
             "$TARGET_DB" 2> "$ERR_LOG"
